@@ -11,7 +11,6 @@ import sys
 import threading
 import zlib
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -115,7 +114,7 @@ def test_capabilities(conn):
     status, body = _get(conn, "/capabilities")
     assert status == 200
     assert set(body["tools"]) == {"c2patool", "exiftool", "qpdf", "ghostscript", "ffmpeg"}
-    assert "pixel_backends" in body
+    assert "pixel_backends" not in body
     assert "scorers" in body
     assert "harnesses" in body
 
@@ -184,23 +183,6 @@ def test_clean_text_roundtrip(conn):
     assert body["report"]["stats"]["removed_count"] == 2
 
 
-def test_clean_text_accepts_style_option(conn):
-    # "style" is accepted + validated (string) on /clean for forward-compat, but
-    # text cleaning stays deterministic Layer A — the service holds no rewrite
-    # model, so the option is parsed and ignored for text.
-    data = "Hello\u200bWorld\u00ad!".encode("utf-8")
-    status, body = _post(
-        conn,
-        "/clean",
-        {"file": _b64(data), "name": "note.txt", "options": {"style": "write like hemingway"}},
-    )
-    assert status == 200
-    assert body["kind"] == "text"
-    cleaned = base64.b64decode(body["cleaned"]).decode("utf-8")
-    assert cleaned == "HelloWorld!"
-    assert body["report"]["stats"]["removed_count"] == 2
-
-
 def test_clean_png_strips_metadata(conn):
     data = _watermarked_png()
     status, body = _post(conn, "/clean", {"file": _b64(data), "name": "shot.png"})
@@ -222,116 +204,23 @@ def test_clean_markdown_container(conn):
     assert body["report"]["format"] == "markdown"
 
 
-def test_clean_av_honors_remove_pixel(conn, monkeypatch):
-    # No purification backend is configured in the test env, so remove_pixel on
-    # the AV path must be accepted and reported as unavailable (not silently
-    # ignored), while the metadata strip still runs.
-    for var in ("NOAI_WATERMARK_DIR", "MARKDIFFUSION_DIR"):
-        monkeypatch.delenv(var, raising=False)
-    data = _minimal_mp4()
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("strategy", "paraphrase@0.8"),
+        ("style", "write like hemingway"),
+        ("remove_pixel", "ctrlregen"),
+        ("remove_audio_watermark", True),
+    ],
+)
+def test_evasion_options_removed_in_fork(conn, key, value):
+    # This fork removed Layer B rewrite, pixel and audio watermark removal:
+    # their options are unknown and rejected rather than silently ignored.
     status, body = _post(
-        conn,
-        "/clean",
-        {"file": _b64(data), "name": "clip.mp4", "options": {"remove_pixel": "ctrlregen"}},
-    )
-    assert status == 200
-    assert body["kind"] == "av"
-    assert body["report"]["pixel_removal"]["available"] is False
-    assert any("video purification" in a for a in body["report"]["actions"])
-    # The cleaned payload length must match the reported bytes_out.
-    assert len(base64.b64decode(body["cleaned"])) == body["report"]["bytes_out"]
-
-
-def test_clean_av_honors_remove_audio_watermark(conn):
-    data = _minimal_wav()
-    status, body = _post(
-        conn,
-        "/clean",
-        {"file": _b64(data), "name": "clip.wav", "options": {"remove_audio_watermark": True}},
-    )
-    assert status == 200
-    assert body["kind"] == "av"
-    assert "audio_mark_removal" in body["report"]
-    assert "available" in body["report"]["audio_mark_removal"]
-    assert len(base64.b64decode(body["cleaned"])) == body["report"]["bytes_out"]
-
-
-def test_clean_av_m4a_reencode_dest_distinct_from_container_clean(conn, monkeypatch):
-    """An .m4a input must not reuse the container-clean dest for the re-encode.
-
-    The AV branch derives the container-clean dest as ``out<ext>`` (so ``.m4a``
-    gives ``out.m4a``). If the audio chain re-used the same name, ffmpeg would
-    refuse to edit its input in place and silently skip the chain. This stubs
-    ``audio_purify`` so the regression is independent of whether ffmpeg is on
-    the runner.
-    """
-    calls: list[tuple[Path, Path]] = []
-
-    def fake_purify(src: Path, dest: Path) -> dict:
-        calls.append((src, dest))
-        return {"available": False, "error": "spy: ffmpeg unavailable"}
-
-    monkeypatch.setattr(server, "audio_purify", fake_purify)
-    monkeypatch.setattr(server, "media_has_video", lambda path: False)
-
-    status, _ = _post(
-        conn,
-        "/clean",
-        {
-            "file": _b64(_minimal_mp4()),
-            "name": "audio.m4a",
-            "options": {"remove_audio_watermark": True},
-        },
-    )
-    assert status == 200
-    assert len(calls) == 1, "audio_purify should run once for an .m4a audio item"
-    src, dest = calls[0]
-    assert src != dest, "re-encode dest must be distinct from the container-clean dest"
-
-
-def test_clean_av_m4a_success_uses_reencode_dest_output(conn, monkeypatch):
-    """A successful purify run must become the returned report and cleaned bytes.
-
-    The success path re-points the handler at the re-encode dest: after the
-    chain writes its output there, `bytes_out`/`cleaned` must reflect that file,
-    not the earlier container-clean output.
-    """
-    out_bytes = _minimal_mp4()
-
-    def fake_purify(src: Path, dest: Path) -> dict:
-        dest.write_bytes(out_bytes)
-        return {"available": True, "tempo": 1.08, "pitch_semitones": 2.0, "codec": "aac"}
-
-    after = SimpleNamespace(has_c2pa=False, has_ai_metadata=False, findings=[], format="mp4")
-    monkeypatch.setattr(server, "audio_purify", fake_purify)
-    monkeypatch.setattr(server, "media_has_video", lambda path: False)
-    monkeypatch.setattr(server, "inspect_av", lambda path: after)
-
-    status, body = _post(
-        conn,
-        "/clean",
-        {
-            "file": _b64(_minimal_mp4()),
-            "name": "audio.m4a",
-            "options": {"remove_audio_watermark": True},
-        },
-    )
-    assert status == 200
-    assert body["report"]["audio_mark_removal"]["available"] is True
-    assert any("destructive audio watermark chain" in a for a in body["report"]["actions"])
-    assert body["report"]["bytes_out"] == len(out_bytes)
-    assert base64.b64decode(body["cleaned"]) == out_bytes
-
-
-def test_clean_av_rejects_invalid_remove_pixel(conn):
-    data = _minimal_mp4()
-    status, body = _post(
-        conn,
-        "/clean",
-        {"file": _b64(data), "name": "clip.mp4", "options": {"remove_pixel": "bogus"}},
+        conn, "/clean", {"file": _b64(b"x"), "name": "x.txt", "options": {key: value}}
     )
     assert status == 400
-    assert "remove_pixel" in body["error"]
+    assert body["error"] == f"unknown option: {key}"
 
 
 def test_unknown_option_rejected(conn):
@@ -406,9 +295,6 @@ def test_known_clean_attachments_modes_accepted(conn):
         ("keep_non_ai_metadata", None, "boolean"),
         ("also_layer_a_text", {}, "boolean"),
         ("strip_all_metadata", [], "boolean"),
-        ("remove_pixel", False, "string"),
-        ("remove_audio_watermark", "false", "boolean"),
-        ("style", 123, "string"),
     ],
 )
 def test_option_wrong_type_rejected(conn, key, value, type_name):

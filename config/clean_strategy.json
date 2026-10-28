@@ -1,3 +1,0 @@
-{
-  "default_strategy": "paraphrase@0.8,mlm@0.2"
-}

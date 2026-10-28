@@ -2,7 +2,7 @@
 
 Exercises the replay arithmetic of detect_gumbel.py with a toy keyed
 Gumbel-max generator, the TextDetector protocol in text_detectors.py, and
-the gumbel evaluator wiring in rewrite_text.py.
+the gumbel detector (the rewrite_text.py evaluator was removed in this fork).
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import detect_gumbel
-import rewrite_text
 import text_detectors
 
 KEY_HEX = "0x" + "ab" * 16  # 16 raw bytes
@@ -314,98 +313,3 @@ def test_gumbel_in_detector_registry(monkeypatch):
     assert "gumbel" in names
     monkeypatch.setenv("WATERMARKS_GUMBEL_KEY", KEY_HEX)
     assert text_detectors.detector_status()["gumbel"] is True
-
-
-# --- rewrite_text.py gumbel evaluator ----------------------------------------
-
-
-def _rewrite_kwargs(**overrides):
-    kwargs = dict(
-        backend="ollama",
-        model="m",
-        base_url="http://127.0.0.1:11434",
-        api_key=None,
-        tactic="paraphrase",
-        lang="French",
-        original_lang="English",
-        timeout=10,
-        layer_a_after=False,
-        temperature=0.9,
-        candidates=1,
-    )
-    kwargs.update(overrides)
-    return kwargs
-
-
-def test_rewrite_gumbel_evaluator_clears_mark(monkeypatch):
-    rng = _rng(11)
-    original = _marked_text(400, rng)
-    monkeypatch.setattr(
-        rewrite_text,
-        "call_ollama",
-        lambda *a, **k: "alpha beta gamma delta epsilon zeta eta theta",
-    )
-    _out, info = rewrite_text.rewrite(original, **_rewrite_kwargs(gumbel_key=KEY_HEX))
-    assert info["evaluator"] == "gumbel"
-    assert info["passed"] is True
-    assert info["attempts_made"] == 1
-    g = info["gumbel"]
-    assert g["before"]["is_watermarked"] is True
-    assert g["after"]["is_watermarked"] is False
-    assert g["cleared"] is True
-    assert info["candidate_scores"][0]["evaluation"]["detector"] == "gumbel"
-    assert _out == "alpha beta gamma delta epsilon zeta eta theta"
-
-
-def test_gumbel_takes_priority_over_markllm(monkeypatch):
-    built = {}
-
-    class _FakeMarkLLM:
-        def __init__(self, **kwargs):
-            built["markllm"] = True
-
-        def available(self):
-            return True
-
-        def detect(self, text):
-            return {"detector": "markllm", "available": True, "is_watermarked": False, "score": 0.0}
-
-    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _FakeMarkLLM)
-    monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: "alpha beta gamma delta")
-    _out, info = rewrite_text.rewrite(
-        "plain text here",
-        **_rewrite_kwargs(gumbel_key=KEY_HEX, markllm_scheme="kgw", markllm_dir="/x"),
-    )
-    assert built["markllm"] is True
-    assert info["evaluator"] == "gumbel"
-    assert "markllm" in info and "gumbel" in info
-    assert info["passed"] is True
-
-
-def test_gumbel_key_does_not_build_markllm(monkeypatch):
-    monkeypatch.setattr(
-        rewrite_text,
-        "MarkLLMTextDetector",
-        lambda *a, **k: pytest.fail("markllm must not be built when only gumbel is set"),
-    )
-    monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: "alpha beta gamma delta")
-    _out, info = rewrite_text.rewrite("plain text here", **_rewrite_kwargs(gumbel_key=KEY_HEX))
-    assert info["evaluator"] == "gumbel"
-    assert info["passed"] is True
-    assert "markllm" not in info
-
-
-def test_no_gumbel_without_key(monkeypatch):
-    monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: "alpha beta gamma delta")
-    _out, info = rewrite_text.rewrite("plain text here", **_rewrite_kwargs())
-    assert "gumbel" not in info
-    assert info["evaluator"] == "lexical-divergence"
-
-
-def test_gumbel_key_flag_defaults_from_env(monkeypatch):
-    monkeypatch.setenv("WATERMARKS_GUMBEL_KEY", KEY_HEX)
-    args = rewrite_text.build_parser().parse_args(["x.txt"])
-    assert args.gumbel_key == KEY_HEX
-    monkeypatch.delenv("WATERMARKS_GUMBEL_KEY", raising=False)
-    args = rewrite_text.build_parser().parse_args(["x.txt"])
-    assert args.gumbel_key is None

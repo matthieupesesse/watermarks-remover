@@ -8,8 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "service" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -342,41 +340,3 @@ def test_cli_watermark_runtime_error(tmp_path: Path):
     )
     assert r.returncode == 1
     assert "boom" in (r.stderr or "")
-
-
-def test_rewrite_markllm_hook_records_before_after(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    import rewrite_text
-
-    class _FakeDetector:
-        def __init__(self, **kwargs):
-            pass
-
-        def detect(self, text):
-            return {"available": True, "is_watermarked": text == "ORIG", "score": 3.0}
-
-    monkeypatch.setattr(rewrite_text, "MarkLLMTextDetector", _FakeDetector)
-    monkeypatch.setattr(rewrite_text, "call_ollama", lambda *a, **k: "REWRITTEN OUTPUT")
-    out, info = rewrite_text.rewrite(
-        "ORIG",
-        backend="ollama",
-        model="m",
-        base_url="http://127.0.0.1:11434",
-        api_key=None,
-        tactic="paraphrase",
-        lang="French",
-        original_lang="English",
-        timeout=10,
-        layer_a_after=False,
-        temperature=0.9,
-        candidates=1,
-        markllm_scheme="kgw",
-        markllm_dir=str(tmp_path / "x"),
-        markllm_model="opt-1.3b",
-        markllm_timeout=5,
-    )
-    assert out == "REWRITTEN OUTPUT"
-    mk = info["markllm"]
-    assert mk["before"]["is_watermarked"] is True
-    assert mk["after"]["is_watermarked"] is False
-    assert mk["cleared"] is True
-    assert "note" in mk

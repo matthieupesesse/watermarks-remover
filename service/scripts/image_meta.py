@@ -40,28 +40,6 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 # set the env vars after import.
 DEFAULT_SYNTHID_SCORER_TIMEOUT = 60.0
 
-# CtrlRegen is torch-based and needs far more address space than the stdlib
-# parsers. The invoking clean_image.py subprocess applies these higher,
-# env-overridable caps instead of the default child limits in common.py.
-_CTRLREGEN_RLIMIT_AS = int(os.environ.get("WATERMARKS_CTRLREGEN_RLIMIT_AS", str(32 << 30)))
-_CTRLREGEN_RLIMIT_FSIZE = int(os.environ.get("WATERMARKS_CTRLREGEN_RLIMIT_FSIZE", str(2 << 30)))
-
-
-def ctrlregen_preexec_fn() -> None:
-    """Higher resource caps for the CtrlRegen subprocess (torch memory)."""
-    try:
-        import resource
-
-        resource.setrlimit(resource.RLIMIT_AS, (_CTRLREGEN_RLIMIT_AS, _CTRLREGEN_RLIMIT_AS))
-        resource.setrlimit(
-            resource.RLIMIT_FSIZE, (_CTRLREGEN_RLIMIT_FSIZE, _CTRLREGEN_RLIMIT_FSIZE)
-        )
-    except (ImportError, OSError, ValueError):
-        pass
-
-
-ctrlregen_subprocess_preexec_fn = ctrlregen_preexec_fn if os.name == "posix" else None
-
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 JPEG_SOI = b"\xff\xd8"
 WEBP_RIFF = b"RIFF"
@@ -1665,185 +1643,6 @@ def run_synthid_score(
         return {"available": False, "error": f"bad scorer JSON: {e}"}
 
 
-def _ctrlregen_python(upstream: Path) -> str:
-    """Prefer the checkout venv so torch/diffusers are importable."""
-    if os.name == "nt":
-        venv = upstream / ".venv" / "Scripts" / "python.exe"
-    else:
-        venv = upstream / ".venv" / "bin" / "python"
-    if venv.is_file():
-        return str(venv)
-    return sys.executable
-
-
-def _markdiffusion_python(upstream: Path | None) -> str:
-    """Prefer the bootstrap venv so torch/diffusers/markdiffusion importable."""
-    if upstream is not None:
-        if os.name == "nt":
-            venv = upstream / ".venv" / "Scripts" / "python.exe"
-        else:
-            venv = upstream / ".venv" / "bin" / "python"
-        if venv.is_file():
-            return str(venv)
-    return sys.executable
-
-
-def run_markdiffusion_purify(
-    path: Path,
-    output: Path,
-    *,
-    upstream_dir: str | None = None,
-    intensity: float = 0.3,
-    model: str | None = None,
-    size: int = 512,
-    steps: int = 50,
-    device: str | None = None,
-    timeout: int = 3600,
-) -> dict[str, Any]:
-    """Run the optional MarkDiffusion DiffusionPurification remover in a subprocess.
-
-    Returns ``{"available": False, "error": ...}`` when the backend is not
-    configured, its dependencies are missing, or it fails at runtime; a
-    successful run is ``{"available": True, ...}``.
-    """
-    if upstream_dir is None:
-        upstream_dir = os.environ.get("MARKDIFFUSION_DIR")
-
-    upstream = Path(upstream_dir).expanduser().resolve() if upstream_dir else None
-    if upstream is not None and not upstream.is_dir():
-        return {
-            "available": False,
-            "error": f"MarkDiffusion dir not found: {upstream}",
-        }
-
-    script = SCRIPTS_DIR / "markdiffusion_harness.py"
-    cmd = [
-        _markdiffusion_python(upstream),
-        str(script),
-        "purify",
-        str(path),
-        "-o",
-        str(output),
-        "--purification-intensity",
-        str(intensity),
-        "--size",
-        str(size),
-        "--steps",
-        str(steps),
-        "--json",
-    ]
-    if upstream is not None:
-        cmd += ["--upstream-dir", str(upstream)]
-    if model:
-        cmd += ["--model", str(model)]
-    if device:
-        cmd += ["--device", str(device)]
-
-    try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            preexec_fn=ctrlregen_subprocess_preexec_fn,
-            check=False,
-            creationflags=subprocess_creationflags,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "available": False,
-            "error": f"DiffusionPurification timed out after {timeout}s",
-        }
-    except Exception as e:
-        return {"available": False, "error": str(e)}
-
-    if r.returncode != 0:
-        return {"available": False, "error": (r.stderr or "").strip()[:2000]}
-    try:
-        payload = json.loads(r.stdout or "{}")
-    except json.JSONDecodeError as e:
-        return {
-            "available": False,
-            "error": f"bad MarkDiffusion adapter JSON: {e}",
-        }
-    payload["available"] = True
-    return payload
-
-
-def run_ctrlregen_clean(
-    path: Path,
-    output: Path,
-    *,
-    upstream_dir: str | None = None,
-    intensity: float = 0.25,
-    steps: int = 50,
-    device: str | None = None,
-    seed: int | None = None,
-    timeout: int = 3600,
-) -> dict[str, Any]:
-    """Run the optional CtrlRegen remover in a subprocess.
-
-    Returns ``{"available": False, "error": ...}`` when the remover is not
-    configured, its dependencies are missing, or it fails at runtime; a
-    successful run is ``{"available": True, ...}``.
-    """
-    if upstream_dir is None:
-        upstream_dir = os.environ.get("NOAI_WATERMARK_DIR")
-    if not upstream_dir:
-        return {
-            "available": False,
-            "error": "CtrlRegen not configured (set NOAI_WATERMARK_DIR or pass --ctrlregen-dir)",
-        }
-
-    upstream = Path(upstream_dir).expanduser().resolve()
-    if not upstream.is_dir():
-        return {"available": False, "error": f"CtrlRegen dir not found: {upstream}"}
-
-    script = SCRIPTS_DIR / "clean_ctrlregen.py"
-    cmd = [
-        _ctrlregen_python(upstream),
-        str(script),
-        str(path),
-        "-o",
-        str(output),
-        "--upstream-dir",
-        str(upstream),
-        "--intensity",
-        str(intensity),
-        "--steps",
-        str(steps),
-        "--json",
-    ]
-    if device:
-        cmd += ["--device", str(device)]
-    if seed is not None:
-        cmd += ["--seed", str(seed)]
-
-    try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            preexec_fn=ctrlregen_subprocess_preexec_fn,
-            check=False,
-            creationflags=subprocess_creationflags,
-        )
-    except subprocess.TimeoutExpired:
-        return {"available": False, "error": f"CtrlRegen timed out after {timeout}s"}
-    except Exception as e:
-        return {"available": False, "error": str(e)}
-
-    if r.returncode != 0:
-        return {"available": False, "error": (r.stderr or "").strip()[:2000]}
-    try:
-        payload = json.loads(r.stdout or "{}")
-    except json.JSONDecodeError as e:
-        return {"available": False, "error": f"bad CtrlRegen adapter JSON: {e}"}
-    payload["available"] = True
-    return payload
-
-
 def synthid_is_watermarked(entry: dict[str, Any] | None) -> bool:
     """True if *entry* indicates an affirmative SynthID watermark detection."""
     if not entry or not entry.get("available"):
@@ -2222,20 +2021,6 @@ def clean_image(
     *,
     strip_all_metadata: bool = True,
     synthid_dir: str | None = None,
-    remove_pixel: str | None = None,
-    ctrlregen_dir: str | None = None,
-    ctrlregen_intensity: float = 0.25,
-    ctrlregen_steps: int = 50,
-    ctrlregen_device: str | None = None,
-    ctrlregen_seed: int | None = None,
-    ctrlregen_timeout: int = 3600,
-    markdiffusion_dir: str | None = None,
-    markdiffusion_intensity: float = 0.3,
-    markdiffusion_model: str | None = None,
-    markdiffusion_size: int = 512,
-    markdiffusion_steps: int = 50,
-    markdiffusion_device: str | None = None,
-    markdiffusion_timeout: int = 3600,
 ) -> dict[str, Any]:
     synthid_before = run_synthid_score(path, synthid_dir)
     data = path.read_bytes()
@@ -2280,55 +2065,10 @@ def clean_image(
         except Exception as e:
             actions.append(f"exiftool failed: {e}")
 
-    pixel_removal: dict[str, Any] | None = None
-    if remove_pixel:
-        if remove_pixel == "ctrlregen":
-            pixel_removal = run_ctrlregen_clean(
-                dest,
-                dest,
-                upstream_dir=ctrlregen_dir,
-                intensity=ctrlregen_intensity,
-                steps=ctrlregen_steps,
-                device=ctrlregen_device,
-                seed=ctrlregen_seed,
-                timeout=ctrlregen_timeout,
-            )
-            if pixel_removal.get("available"):
-                actions.append(f"CtrlRegen pixel removal (intensity {ctrlregen_intensity})")
-            else:
-                actions.append(
-                    "CtrlRegen pixel removal skipped: "
-                    f"{pixel_removal.get('error', 'unknown error')}"
-                )
-        elif remove_pixel == "diffusion":
-            pixel_removal = run_markdiffusion_purify(
-                dest,
-                dest,
-                upstream_dir=markdiffusion_dir,
-                intensity=markdiffusion_intensity,
-                model=markdiffusion_model,
-                size=markdiffusion_size,
-                steps=markdiffusion_steps,
-                device=markdiffusion_device,
-                timeout=markdiffusion_timeout,
-            )
-            if pixel_removal.get("available"):
-                actions.append(
-                    f"DiffusionPurification pixel removal (intensity {markdiffusion_intensity})"
-                )
-            else:
-                actions.append(
-                    "DiffusionPurification pixel removal skipped: "
-                    f"{pixel_removal.get('error', 'unknown error')}"
-                )
-        else:
-            raise ValueError(f"unknown pixel remover: {remove_pixel}")
-
     # Residual scan on the final cleaned bytes: run the stdlib inspector plus
     # the c2patool C2PA verifier only. clean_image discards the exiftool tool
     # dump, so skip that subprocess. SynthID scores pixels, so a metadata-only
-    # clean leaves the score identical to synthid_before; re-score only when a
-    # pixel remover actually changed the image.
+    # clean leaves the score identical to synthid_before.
     final_bytes = dest.read_bytes()
     changed = final_bytes != data
     after = inspect_image(
@@ -2338,10 +2078,7 @@ def clean_image(
         run_synthid=False,
         include_exiftool=False,
     )
-    if pixel_removal is not None and pixel_removal.get("available"):
-        synthid_after = run_synthid_score(dest, synthid_dir)
-    else:
-        synthid_after = synthid_before
+    synthid_after = synthid_before
     return {
         "input": str(path),
         "output": str(dest),
@@ -2355,5 +2092,4 @@ def clean_image(
         "post_findings": after.findings,
         "synthid_before": synthid_before,
         "synthid_after": synthid_after,
-        "pixel_removal": pixel_removal,
     }

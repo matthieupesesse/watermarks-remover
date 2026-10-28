@@ -47,7 +47,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 from datetime import datetime
 from functools import cache
 from http import HTTPStatus
@@ -59,8 +58,6 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from av_meta import clean_av, inspect_av
-from clean_audio import audio_purify, is_audio_format, is_audio_name, media_has_video
-from clean_video import video_purify
 from common import (
     MAX_INPUT_BYTES,
     eprint,
@@ -108,20 +105,12 @@ ALLOWED_CLEAN_OPTIONS = {
     "normalize_spaces": bool,
     "keep_non_ai_metadata": bool,
     "also_layer_a_text": bool,
-    "remove_pixel": str,
-    "remove_audio_watermark": bool,
     "strip_all_metadata": bool,
     "detect_before": bool,
     "detect_after": bool,
     "deep_images": str,
     "clean_attachments": str,
-    "style": str,
-    "strategy": str,
 }
-
-# Default Layer B strategy loaded from the strategy config file (overridable by
-# env/CLI). None means no Layer B rewrite on text.
-_DEFAULT_STRATEGY: str | None = None
 
 
 @cache
@@ -205,10 +194,6 @@ def capabilities() -> dict[str, Any]:
             "qpdf": _tool_usable("qpdf"),
             "ghostscript": _ghostscript_usable(),
             "ffmpeg": _tool_usable("ffmpeg"),
-        },
-        "pixel_backends": {
-            "ctrlregen": bool(os.environ.get("NOAI_WATERMARK_DIR")),
-            "diffusion": bool(os.environ.get("MARKDIFFUSION_DIR")),
         },
         "scorers": {
             "synthid": bool(os.environ.get("REVERSE_SYNTHID_DIR")),
@@ -480,12 +465,6 @@ _OPENAPI_PATHS: dict[str, dict[str, Any]] = {
                             properties={
                                 k: _schema(type="boolean")
                                 for k in ("c2patool", "exiftool", "qpdf", "ghostscript", "ffmpeg")
-                            },
-                        ),
-                        "pixel_backends": _schema(
-                            type="object",
-                            properties={
-                                k: _schema(type="boolean") for k in ("ctrlregen", "diffusion")
                             },
                         ),
                         "scorers": _schema(
@@ -929,103 +908,7 @@ def _parse_clean_options(options: Any) -> dict[str, Any]:
         raise ValueError(
             f"option 'clean_attachments' must be one of {sorted(CLEAN_ATTACHMENT_MODES)}"
         )
-    # A per-request strategy overrides the default; validate it up front so a bad
-    # tactic/intensity is a 400 rather than a mid-clean failure.
-    if "strategy" in options:
-        from rewrite_text import parse_strategy
-
-        parse_strategy(options["strategy"])
     return options
-
-
-def _load_default_strategy(config_path: Path) -> str | None:
-    """Read the default Layer B strategy from the config file.
-
-    Returns None when the config file is absent (no Layer B on text). A file that
-    is present but malformed (bad JSON, unknown tactic, bad intensity) is a
-    startup error, since the config is explicit in-repo.
-    """
-    try:
-        data = json.loads(config_path.read_text())
-    except FileNotFoundError:
-        return None
-    except json.JSONDecodeError as e:
-        raise SystemExit(f"invalid strategy config {config_path}: {e}") from e
-    spec = data.get("default_strategy")
-    if spec is None:
-        return None
-    from rewrite_text import parse_strategy
-
-    parse_strategy(spec)  # raises ValueError on a bad strategy
-    return spec
-
-
-def _apply_layer_b(text: str, strategy: str, options: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """Apply a Layer B rewrite strategy to *text*, rejecting if unavailable.
-
-    Raises ValueError for an unconfigured/unavailable backend or model so the
-    caller surfaces a 400 rather than a 500. Wraps runtime failures the same way.
-    """
-    from rewrite_text import LLM_TACTICS, apply_strategy, parse_strategy
-
-    steps = parse_strategy(strategy)
-    needs_llm = any(t in LLM_TACTICS for t, _ in steps)
-    backend = os.environ.get("WATERMARKS_REWRITE_BACKEND", "print-prompt")
-    if needs_llm:
-        if backend not in ("openai-compatible", "ollama"):
-            raise ValueError(
-                "Layer B strategy needs an LLM rewrite backend (WATERMARKS_REWRITE_BACKEND)"
-            )
-        needs_key = backend == "openai-compatible"
-        missing = not os.environ.get("WATERMARKS_REWRITE_MODEL") or not os.environ.get(
-            "WATERMARKS_REWRITE_BASE_URL"
-        )
-        if needs_key:
-            missing = missing or not os.environ.get("WATERMARKS_REWRITE_API_KEY")
-        if missing:
-            required = "WATERMARKS_REWRITE_MODEL/BASE_URL"
-            if needs_key:
-                required += "/API_KEY"
-            raise ValueError(f"Layer B strategy needs the rewrite backend configured ({required})")
-    if any(t == "mlm" for t, _ in steps):
-        import importlib.util
-
-        if importlib.util.find_spec("transformers") is None:
-            raise ValueError("Layer B 'mlm' step requires transformers")
-    base_url = os.environ.get("WATERMARKS_REWRITE_BASE_URL")
-    if needs_llm and base_url:
-        host = urlparse(base_url).hostname or ""
-        allow_remote = os.environ.get("WATERMARKS_REWRITE_ALLOW_REMOTE", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        if host not in ("127.0.0.1", "localhost", "::1") and not allow_remote:
-            raise ValueError(
-                "Layer B strategy uses a remote rewrite endpoint; set "
-                "WATERMARKS_REWRITE_ALLOW_REMOTE=1"
-            )
-    try:
-        out, stats = apply_strategy(
-            text,
-            steps,
-            backend=backend,
-            model=os.environ.get("WATERMARKS_REWRITE_MODEL"),
-            base_url=os.environ.get("WATERMARKS_REWRITE_BASE_URL"),
-            api_key=os.environ.get("WATERMARKS_REWRITE_API_KEY"),
-            temperature=float(os.environ.get("WATERMARKS_REWRITE_TEMPERATURE", "0.9")),
-            reasoning_effort=(
-                None
-                if os.environ.get("WATERMARKS_REWRITE_REASONING_EFFORT") == "off"
-                else os.environ.get("WATERMARKS_REWRITE_REASONING_EFFORT") or None
-            ),
-            style=options.get("style"),
-            layer_a_after=bool(options.get("also_layer_a_text")),
-        )
-    except (RuntimeError, TimeoutError, urllib.error.URLError) as e:
-        raise ValueError(f"Layer B rewrite failed: {e}") from e
-    return out, stats
 
 
 def _batch_items(
@@ -1252,22 +1135,10 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                 aggressive_homoglyphs=bool(options.get("aggressive_homoglyphs")),
                 normalize_spaces=bool(options.get("normalize_spaces", True)),
             )
-            # Layer B is a required step for text cleaning: always apply the
-            # default (or per-request) rewrite strategy and reject (400) when no
-            # strategy is available or a step's backend/model can't run.
-            strategy = options.get("strategy") or _DEFAULT_STRATEGY
-            if not strategy:
-                raise ValueError(
-                    "Layer B rewrite is required for text cleaning; configure a "
-                    "default strategy (config/clean_strategy.json) or pass "
-                    "options.strategy"
-                )
-            cleaned, layer_b = _apply_layer_b(cleaned, strategy, options)
             if detect_after:
                 detector_reports["after"] = run_text_detectors(cleaned)
             cleaned_bytes = cleaned.encode("utf-8", errors="surrogateescape")
             report: dict[str, Any] = {"kind": "text", "stats": stats, "length": len(cleaned)}
-            report["layer_b"] = layer_b
             if detector_reports:
                 report["text_detectors"] = detector_reports
         elif kind == "image":
@@ -1281,15 +1152,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
             strip_all = not bool(options.get("keep_non_ai_metadata"))
             if "strip_all_metadata" in options:
                 strip_all = bool(options["strip_all_metadata"])
-            remove_pixel = options.get("remove_pixel")
-            if remove_pixel not in (None, "ctrlregen", "diffusion"):
-                raise ValueError("remove_pixel must be one of: ctrlregen, diffusion")
-            result = clean_image(
-                src,
-                dest,
-                strip_all_metadata=strip_all,
-                remove_pixel=remove_pixel,
-            )
+            result = clean_image(src, dest, strip_all_metadata=strip_all)
             if bool(options.get("detect_before")) and result.get("synthid_before") is None:
                 result["synthid_before"] = run_synthid_score(src)
             if bool(options.get("detect_after")) and result.get("synthid_after") is None:
@@ -1301,70 +1164,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
             strip_all = not bool(options.get("keep_non_ai_metadata"))
             if "strip_all_metadata" in options:
                 strip_all = bool(options["strip_all_metadata"])
-            remove_pixel = options.get("remove_pixel")
-            if remove_pixel not in (None, "ctrlregen", "diffusion"):
-                raise ValueError("remove_pixel must be one of: ctrlregen, diffusion")
             result = clean_av(src, dest, strip_all_metadata=strip_all)
-            # Only run the audio chain on audio-only media. WAV/MP3/FLAC are
-            # definitive audio containers (no video stream possible); the
-            # MP4-family/OGG audio names (.m4a/.aac/.ogg/.opus) could be a
-            # mislabeled video, so only treat those as audio when a stream probe
-            # confirms there is no video track (an inconclusive probe is not
-            # "no video", to avoid dropping a video track via the -vn re-encode).
-            definitely_audio = is_audio_format(result.get("format", ""))
-            is_audio = definitely_audio or (is_audio_name(name) and media_has_video(src) is False)
-            if is_audio and options.get("remove_audio_watermark"):
-                # The container-clean dest above is "out" + the input suffix, so an
-                # .m4a input made both paths "out.m4a". ffmpeg refuses to edit a file
-                # in place, which silently skipped the chain while /clean still 200'd,
-                # so keep the re-encode dest literally distinct (an input suffix can
-                # never be "-audio.m4a").
-                audio_dest = _tmp_path(tmpdir, "out-audio.m4a")
-                audio_res = audio_purify(dest, audio_dest)
-                result["audio_mark_removal"] = audio_res
-                if audio_res.get("available"):
-                    dest = audio_dest
-                    result["actions"].append(
-                        f"destructive audio watermark chain (tempo {audio_res.get('tempo')}x, "
-                        f"{audio_res.get('pitch_semitones'):+.1f} semitones, "
-                        f"{audio_res.get('codec')})"
-                    )
-                    # The chain re-encodes to M4A, so the metadata-clean report
-                    # fields are stale; recompute them from the final file and
-                    # reflect the new container, not the source format.
-                    after = inspect_av(dest)
-                    result["format"] = after.format
-                    result["bytes_out"] = dest.stat().st_size
-                    result["changed"] = True
-                    result["still_has_c2pa"] = after.has_c2pa
-                    result["still_has_ai_metadata"] = after.has_ai_metadata
-                    result["post_findings"] = after.findings
-                else:
-                    result["actions"].append(
-                        "destructive audio watermark chain skipped: "
-                        f"{audio_res.get('error', 'unknown error')}"
-                    )
-            elif remove_pixel:
-                pix = video_purify(dest, dest, remove_pixel=remove_pixel)
-                result["pixel_removal"] = pix
-                engine = "CtrlRegen" if remove_pixel == "ctrlregen" else "DiffusionPurification"
-                if pix.get("available"):
-                    result["actions"].append(
-                        f"{engine} per-frame video purification "
-                        f"({pix.get('frames_purified')}/{pix.get('frames_total')} frames)"
-                    )
-                    # The remux re-encodes the video, so the metadata-clean
-                    # report fields are stale; recompute them from the final file.
-                    after = inspect_av(dest)
-                    result["bytes_out"] = dest.stat().st_size
-                    result["changed"] = True
-                    result["still_has_c2pa"] = after.has_c2pa
-                    result["still_has_ai_metadata"] = after.has_ai_metadata
-                    result["post_findings"] = after.findings
-                else:
-                    result["actions"].append(
-                        f"per-frame video purification skipped: {pix.get('error', 'unknown error')}"
-                    )
             cleaned_bytes = dest.read_bytes()
             report = {"kind": "av", **result}
         else:
@@ -1673,13 +1473,6 @@ def main() -> int:
         "--port", type=int, default=int(os.environ.get("WATERMARKS_SERVER_PORT", "8765"))
     )
     p.add_argument("--api-key", default=API_KEY, help="require this bearer token (default: none)")
-    p.add_argument(
-        "--strategy-config",
-        default=os.environ.get("WATERMARKS_CLEAN_STRATEGY_FILE", "config/clean_strategy.json"),
-        help="Path to the Layer B strategy config JSON (default: "
-        "config/clean_strategy.json; WATERMARKS_CLEAN_STRATEGY_FILE). A strategy "
-        "step is 'tactic@intensity' (e.g. 'paraphrase@0.8,mlm@0.2').",
-    )
     p.add_argument("-V", "--version", action="store_true", help="print version and exit")
     args = p.parse_args()
 
@@ -1688,8 +1481,6 @@ def main() -> int:
         return 0
 
     API_KEY = args.api_key
-    global _DEFAULT_STRATEGY  # noqa: PLW0603 — loaded once at startup
-    _DEFAULT_STRATEGY = _load_default_strategy(Path(args.strategy_config))
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         eprint(f"warning: binding {args.host} — intended for a trusted network only")

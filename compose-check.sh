@@ -18,7 +18,7 @@ else
   FAIL=1
 fi
 
-for svc in wr-markllm wr-markdiffusion wr-ctrlregen wr-synthid; do
+for svc in wr-markllm wr-synthid; do
   if "${COMPOSE[@]}" run --rm "$svc" --help >/dev/null 2>&1; then
     echo "$svc: OK"
   else

@@ -8,6 +8,18 @@ _ _ _ ____ ___ ____ ____ _  _ ____ ____ _  _ ____    ____ ____ _  _ ____ _  _ __
 
 <!-- logo: figlet -d .figlet -f cybermedium -w 120 "watermarks-remover" -->
 
+> **Fork Neurolinks (`neurolinks-safe`).** This fork keeps only hygiene and
+> privacy: Layer A (invisible Unicode), file metadata inspection and cleaning,
+> and the detectors. It **removes** everything built to evade AI provenance or
+> detection: the `stealer/` watermark-stealing module, the Layer B rewrite
+> (`rewrite_text.py`, `humanize_pass.py`, benchmarks), CtrlRegen / MarkDiffusion
+> pixel removal (`clean_video.py`, `--remove-pixel`) and the destructive audio
+> chain (`clean_audio.py`). The server rejects `strategy`, `style`,
+> `remove_pixel` and `remove_audio_watermark` as unknown options. Neurolinks
+> agents do not install the upstream skills below; they use the hub wrapper
+> `neurolinks-hub/bin/ai-marks-clean`, which refuses to strip C2PA / AI markers
+> from generated media. Upstream: `guillaumemeyer/watermarks-remover`.
+
 [![CI](https://github.com/guillaumemeyer/watermarks-remover/actions/workflows/ci.yml/badge.svg)](https://github.com/guillaumemeyer/watermarks-remover/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/guillaumemeyer/watermarks-remover)](https://github.com/guillaumemeyer/watermarks-remover/releases)
 [![Stars](https://img.shields.io/github/stars/guillaumemeyer/watermarks-remover)](https://github.com/guillaumemeyer/watermarks-remover/stargazers)
